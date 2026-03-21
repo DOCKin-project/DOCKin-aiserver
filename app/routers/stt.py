@@ -4,18 +4,17 @@ import os
 import tempfile
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from faster_whisper import WhisperModel
 
+from app.core.config import settings
+from app.core.runtime import get_whisper_model, run_blocking
+from app.core.security import ServiceAuth, sanitize_error_message, sanitize_trace_id
 from app.schemas.stt import SttRequest, SttResponse
 
 router = APIRouter()
 
-model = WhisperModel("tiny", device="cpu")
-bearer_scheme = HTTPBearer(auto_error=False)
-
 
 def _parse_request_payload(raw_payload: str | None, trace_id: str | None) -> SttRequest:
+    trace_id = sanitize_trace_id(trace_id)
     if not raw_payload:
         return SttRequest(traceId=trace_id)
     try:
@@ -29,7 +28,7 @@ def _parse_request_payload(raw_payload: str | None, trace_id: str | None) -> Stt
             detail={
                 "message": "Invalid STT request metadata",
                 "traceId": trace_id,
-                "reason": str(e),
+                "reason": sanitize_error_message(str(e), "invalid metadata"),
             },
         ) from e
 
@@ -41,22 +40,34 @@ async def _run_stt(
     mediaUrl: str | None = Form(None),
     lang: str | None = Form(None),
     traceId: str | None = Form(None),
-    _cred: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),  # 전달만 받음
+    _auth: None = ServiceAuth,
 ):
     req = _parse_request_payload(text or request, traceId)
 
     if file:
+        if not file.content_type or not file.content_type.startswith("audio/"):
+            raise HTTPException(
+                status_code=400,
+                detail={"message": "audio file is required", "traceId": req.traceId},
+            )
         audio_path = None
         try:
+            raw_bytes = await file.read()
+            if len(raw_bytes) > settings.max_upload_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail={"message": "audio file too large", "traceId": req.traceId},
+                )
             # Spring에서 wav로 변환해서 보내기로 계약 → suffix wav 고정
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-                tmp.write(await file.read())
+                tmp.write(raw_bytes)
                 audio_path = tmp.name
 
             language = lang or req.lang or "ko"
 
             try:
-                segments, _info = model.transcribe(
+                segments, _info = await run_blocking(
+                    get_whisper_model().transcribe,
                     audio_path, beam_size=1, language=language
                 )
             except Exception as e:
@@ -65,7 +76,7 @@ async def _run_stt(
                     detail={
                         "message": "STT provider failed",
                         "traceId": req.traceId,
-                        "reason": str(e),
+                        "reason": sanitize_error_message(str(e), "stt failed"),
                     },
                 )
 
@@ -107,9 +118,9 @@ async def stt_hyphenated(
     mediaUrl: str | None = Form(None),
     lang: str | None = Form(None),
     traceId: str | None = Form(None),
-    _cred: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    _auth: None = ServiceAuth,
 ):
-    return await _run_stt(file, text, request, mediaUrl, lang, traceId, _cred)
+    return await _run_stt(file, text, request, mediaUrl, lang, traceId, _auth)
 
 
 @router.post("/api/worklogs/stt", response_model=SttResponse)
@@ -120,6 +131,6 @@ async def stt_legacy(
     mediaUrl: str | None = Form(None),
     lang: str | None = Form(None),
     traceId: str | None = Form(None),
-    _cred: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    _auth: None = ServiceAuth,
 ):
-    return await _run_stt(file, text, request, mediaUrl, lang, traceId, _cred)
+    return await _run_stt(file, text, request, mediaUrl, lang, traceId, _auth)
