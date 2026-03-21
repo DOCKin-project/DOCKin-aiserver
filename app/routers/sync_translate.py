@@ -3,16 +3,18 @@ import os
 import tempfile
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from faster_whisper import WhisperModel
-from transformers import MarianMTModel, MarianTokenizer
 
+from app.core.config import settings
+from app.core.runtime import (
+    get_translation_assets,
+    get_whisper_model,
+    run_blocking,
+)
+from app.core.security import ServiceAuth, sanitize_error_message, sanitize_trace_id
 from app.schemas.stt import RealtimeTranslateResponse
 from app.schemas.translate import TranslateRequest, TranslateResponse
 
 router = APIRouter()
-bearer_scheme = HTTPBearer(auto_error=False)
-stt_model = WhisperModel("tiny", device="cpu")
 
 # 지원 언어쌍별 MarianMT 모델 매핑
 MODEL_NAME_MAP: dict[tuple[str, str], str] = {
@@ -27,42 +29,18 @@ MODEL_NAME_MAP: dict[tuple[str, str], str] = {
 }
 
 # 로드된 모델과 토크나이저 캐시
-model_cache: dict[str, MarianMTModel] = {}
-tokenizer_cache: dict[str, MarianTokenizer] = {}
-
-
-def get_model_and_tokenizer(
-    src: str, tgt: str
-) -> tuple[MarianMTModel, MarianTokenizer, str]:
+def get_model_name(src: str, tgt: str) -> str:
     key = (src, tgt)
     if key not in MODEL_NAME_MAP:
         raise HTTPException(
             status_code=400,
             detail=f"지원하지 않는 번역 언어쌍입니다. source={src}, target={tgt}",
         )
-
-    model_name = MODEL_NAME_MAP[key]
-
-    # 캐시에 없으면 로드
-    if model_name not in model_cache:
-        try:
-            tokenizer_cache[model_name] = MarianTokenizer.from_pretrained(model_name)
-            model_cache[model_name] = MarianMTModel.from_pretrained(model_name)
-        except Exception as e:
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "message": "Translate model load failed",
-                    "model": model_name,
-                    "reason": str(e),
-                },
-            )
-
-    return model_cache[model_name], tokenizer_cache[model_name], model_name
+    return MODEL_NAME_MAP[key]
 
 
-def translate_with_model(text: str, source: str, target: str) -> tuple[str, str]:
-    model, tokenizer, model_name = get_model_and_tokenizer(source, target)
+def _translate_sync(text: str, model_name: str) -> str:
+    model, tokenizer = get_translation_assets(model_name)
     inputs = tokenizer(
         text,
         return_tensors="pt",
@@ -79,10 +57,27 @@ def translate_with_model(text: str, source: str, target: str) -> tuple[str, str]
     )
 
     translated = tokenizer.batch_decode(generated, skip_special_tokens=True)[0]
+    return translated
+
+
+async def translate_with_model(text: str, source: str, target: str) -> tuple[str, str]:
+    model_name = get_model_name(source, target)
+    try:
+        translated = await run_blocking(_translate_sync, text, model_name)
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Translate model load failed",
+                "model": model_name,
+                "reason": sanitize_error_message(str(e), "translate failed"),
+            },
+        ) from e
     return translated, model_name
 
 
 async def _translate(req: TranslateRequest):
+    req.traceId = sanitize_trace_id(req.traceId)
     source_text = req.logText or req.text
     if not source_text:
         raise HTTPException(
@@ -102,10 +97,10 @@ async def _translate(req: TranslateRequest):
             },
         )
 
-    title_translated, title_model_name = translate_with_model(
+    title_translated, title_model_name = await translate_with_model(
         req.title, req.source, req.target
     )
-    body_translated, body_model_name = translate_with_model(
+    body_translated, body_model_name = await translate_with_model(
         source_text, req.source, req.target
     )
 
@@ -122,9 +117,7 @@ async def _translate(req: TranslateRequest):
 @router.post("/api/ai/translate", response_model=TranslateResponse)
 async def translate_ai(
     req: TranslateRequest,
-    _cred: HTTPAuthorizationCredentials | None = Depends(
-        bearer_scheme
-    ),  # JWT 전달만 받음
+    _auth: None = ServiceAuth,
 ):
     try:
         return await _translate(req)
@@ -136,7 +129,7 @@ async def translate_ai(
             detail={
                 "message": "Translate failed",
                 "traceId": req.traceId,
-                "reason": str(e),
+                "reason": sanitize_error_message(str(e), "translate failed"),
             },
         )
 
@@ -144,9 +137,7 @@ async def translate_ai(
 @router.post("/api/translate", response_model=TranslateResponse)
 async def translate_legacy(
     req: TranslateRequest,
-    _cred: HTTPAuthorizationCredentials | None = Depends(
-        bearer_scheme
-    ),  # JWT 전달만 받음
+    _auth: None = ServiceAuth,
 ):
     try:
         return await _translate(req)
@@ -161,7 +152,7 @@ async def translate_legacy(
             detail={
                 "message": "Translate failed",
                 "traceId": req.traceId,
-                "reason": str(e),
+                "reason": sanitize_error_message(str(e), "translate failed"),
             },
         )
 
@@ -172,16 +163,30 @@ async def realtime_translate(
     source: str = Form(...),
     target: str = Form(...),
     traceId: str | None = Form(None),
-    _cred: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    _auth: None = ServiceAuth,
 ):
+    traceId = sanitize_trace_id(traceId)
     audio_path = None
 
     try:
+        if not file.content_type or not file.content_type.startswith("audio/"):
+            raise HTTPException(
+                status_code=400,
+                detail={"message": "audio file is required", "traceId": traceId},
+            )
+        raw_bytes = await file.read()
+        if len(raw_bytes) > settings.max_upload_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail={"message": "audio file too large", "traceId": traceId},
+            )
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-            tmp.write(await file.read())
+            tmp.write(raw_bytes)
             audio_path = tmp.name
 
-        segments, info = stt_model.transcribe(audio_path, beam_size=1, language=source)
+        segments, info = await run_blocking(
+            get_whisper_model().transcribe, audio_path, beam_size=1, language=source
+        )
         original_text = "".join([seg.text for seg in segments]).strip()
 
         if not original_text:
@@ -193,7 +198,7 @@ async def realtime_translate(
                 },
             )
 
-        translated_text, model_name = translate_with_model(original_text, source, target)
+        translated_text, model_name = await translate_with_model(original_text, source, target)
 
         return RealtimeTranslateResponse(
             originalText=original_text,
@@ -211,7 +216,7 @@ async def realtime_translate(
             detail={
                 "message": "Realtime translate failed",
                 "traceId": traceId,
-                "reason": str(e),
+                "reason": sanitize_error_message(str(e), "realtime translate failed"),
             },
         )
     finally:

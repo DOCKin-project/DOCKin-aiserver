@@ -1,23 +1,21 @@
 # routers/chatbot.py
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from openai import OpenAI
 from openai import APIError, RateLimitError, APITimeoutError, APIConnectionError
 
 from app.schemas.chat import ChatRequest, ChatResponse
 from app.core.config import settings
+from app.core.runtime import get_openai_client, run_blocking
+from app.core.security import ServiceAuth, sanitize_error_message, sanitize_trace_id
 
 router = APIRouter()
-client = OpenAI(api_key=settings.openai_api_key)
-
-bearer_scheme = HTTPBearer(auto_error=False)
 
 
 @router.post("/api/chatbot", response_model=ChatResponse)
 async def chatbot(
     req: ChatRequest,
-    _cred: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    _auth: None = ServiceAuth,
 ):
+    req.traceId = sanitize_trace_id(req.traceId)
     if not settings.openai_api_key:
         raise HTTPException(
             status_code=500,
@@ -25,7 +23,8 @@ async def chatbot(
         )
 
     try:
-        completion = client.chat.completions.create(
+        completion = await run_blocking(
+            get_openai_client().chat.completions.create,
             model=settings.openai_model,
             messages=[m.model_dump() for m in req.messages],
         )
@@ -40,7 +39,7 @@ async def chatbot(
             detail={
                 "message": "OpenAI rate limited",
                 "traceId": req.traceId,
-                "reason": str(e),
+                "reason": sanitize_error_message(str(e), "rate limited"),
             },
         )
     except (APITimeoutError, APIConnectionError) as e:
@@ -49,7 +48,7 @@ async def chatbot(
             detail={
                 "message": "OpenAI connection failed",
                 "traceId": req.traceId,
-                "reason": str(e),
+                "reason": sanitize_error_message(str(e), "connection failed"),
             },
         )
     except APIError as e:
@@ -58,7 +57,7 @@ async def chatbot(
             detail={
                 "message": "OpenAI API error",
                 "traceId": req.traceId,
-                "reason": str(e),
+                "reason": sanitize_error_message(str(e), "api error"),
             },
         )
     except Exception as e:
@@ -67,6 +66,6 @@ async def chatbot(
             detail={
                 "message": "Chatbot failed",
                 "traceId": req.traceId,
-                "reason": str(e),
+                "reason": sanitize_error_message(str(e), "chatbot failed"),
             },
         )
